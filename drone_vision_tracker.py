@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import math
+from ultralytics import YOLO
 
 
 class DroneVisionTracker:
@@ -43,6 +44,15 @@ class DroneVisionTracker:
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
         self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+
+        # 5. Object Detection Model (YOLOv8 Nano)
+        self.yolo_model = YOLO("yolov8n.pt")
+
+        # 6. Visual Servoing & Guidance Controller Gains (Proportional Control)
+        self.kp_xy = 0.002
+        self.kp_yaw = 0.05
+        self.guidance_cmd = {"vx": 0.0, "vy": 0.0, "vz": 0.0, "yaw_rate": 0.0}
+        self.flight_mode = "SEARCHING"
 
     def detect_features_grid(self, gray_frame):
         """Distribute feature points uniformly across grid cells."""
@@ -92,35 +102,122 @@ class DroneVisionTracker:
 
         return np.degrees([x, y, z])
 
+    def compute_visual_servoing(self, target_center, frame_shape):
+        """Compute velocity control commands for drone guidance towards target."""
+        h, w = frame_shape[:2]
+        center_x, center_y = w // 2, h // 2
+
+        # Errors in image plane
+        error_x = target_center[0] - center_x
+        error_y = center_y - target_center[1]
+
+        # P-Controller velocity commands
+        vx = np.clip(self.kp_xy * error_y, -1.0, 1.0)
+        vy = np.clip(self.kp_xy * error_x, -1.0, 1.0)
+        yaw_rate = np.clip(self.kp_yaw * (error_x / (w / 2)), -1.0, 1.0)
+
+        self.guidance_cmd = {
+            "vx": round(float(vx), 2),
+            "vy": round(float(vy), 2),
+            "vz": -0.2 if self.flight_mode == "PRECISION_LANDING" else 0.0,
+            "yaw_rate": round(float(yaw_rate), 2)
+        }
+
     def detect_landing_target(self, frame):
         """Detect ArUco landing marker for precision landing."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, rejected = self.aruco_detector.detectMarkers(gray)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
         landing_info = None
 
-        if ids is not None:
+        if ids is not None and len(ids) > 0:
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-            # Center coordinates of the primary landing marker
             c = corners[0][0]
             center_x = int(np.mean(c[:, 0]))
             center_y = int(np.mean(c[:, 1]))
-            cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
-            cv2.putText(frame, f"LANDING PAD ID: {ids[0][0]}", (center_x - 50, center_y - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-            landing_info = (center_x, center_y, ids[0][0])
+            marker_id = int(ids.ravel()[0])
+            landing_info = (center_x, center_y, marker_id)
 
         return landing_info
+
+    def detect_objects_yolo(self, frame):
+        """Detect and track objects using YOLOv8."""
+        results = self.yolo_model(frame, verbose=False, conf=0.45)[0]
+        detected_targets = []
+
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            label = self.yolo_model.names[cls_id]
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 105, 180), 2)
+            cv2.putText(frame, f"{label} {conf:.2f}", (x1, max(y1 - 10, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 105, 180), 2)
+            detected_targets.append((label, (cx, cy)))
+
+        return detected_targets
+
+    def draw_tactical_hud(self, frame, target_pt=None):
+        """Render UAV Tactical Heads-Up Display (HUD)."""
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        # Center Crosshair
+        cv2.line(frame, (cx - 20, cy), (cx + 20, cy), (0, 255, 0), 1)
+        cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 1)
+
+        # Target Lock Box & Vector Line
+        if target_pt is not None:
+            tx, ty = target_pt
+            cv2.line(frame, (cx, cy), (tx, ty), (0, 255, 255), 2)
+            cv2.circle(frame, (tx, ty), 12, (0, 255, 255), 2)
+            cv2.putText(frame, "LOCK", (tx + 15, ty + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+        # Guidance Telemetry Overlay
+        hud_box_x = 20
+        hud_box_y = h - 110
+        cv2.rectangle(frame, (hud_box_x, hud_box_y), (hud_box_x + 240, hud_box_y + 90), (0, 0, 0), -1)
+        cv2.rectangle(frame, (hud_box_x, hud_box_y), (hud_box_x + 240, hud_box_y + 90), (0, 255, 0), 1)
+
+        cv2.putText(frame, f"MODE: {self.flight_mode}", (hud_box_x + 10, hud_box_y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(frame, f"CMD Vx: {self.guidance_cmd['vx']}  Vy: {self.guidance_cmd['vy']}",
+                    (hud_box_x + 10, hud_box_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(frame, f"CMD Vz: {self.guidance_cmd['vz']}  Yaw: {self.guidance_cmd['yaw_rate']}",
+                    (hud_box_x + 10, hud_box_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
     def process_frame(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         annotated = frame.copy()
         status_msg = "TRACKING_OK"
+        target_center = None
 
-        # Detect landing pad
+        # 1. AI Target Detection
+        targets = self.detect_objects_yolo(annotated)
+        if len(targets) > 0:
+            target_center = targets[0][1]
+            self.flight_mode = f"TRACKING_{targets[0][0].upper()}"
+
+        # 2. Precision Landing Target Detection (Priority Override)
         landing_info = self.detect_landing_target(annotated)
         if landing_info is not None:
+            target_center = (landing_info[0], landing_info[1])
+            self.flight_mode = "PRECISION_LANDING"
             status_msg = f"LANDING_PAD_DETECTED [ID:{landing_info[2]}]"
+        elif target_center is None:
+            self.flight_mode = "SEARCHING"
+            self.guidance_cmd = {"vx": 0.0, "vy": 0.0, "vz": 0.0, "yaw_rate": 0.0}
 
+        # 3. Compute Control Servoing Commands
+        if target_center is not None:
+            self.compute_visual_servoing(target_center, frame.shape)
+
+        # 4. Render Tactical HUD
+        self.draw_tactical_hud(annotated, target_center)
+
+        # 5. Feature Tracking Pipeline
         if self.prev_frame is None:
             self.prev_frame = gray
             self.prev_pts = self.detect_features_grid(gray)
@@ -156,7 +253,6 @@ class DroneVisionTracker:
                     self.cur_t = self.cur_t + self.cur_R.dot(scaled_t)
                     self.cur_R = R.dot(self.cur_R)
 
-                    # Update 3D pose trajectory
                     self.trajectory_3d.append(self.cur_t.copy())
                     self.euler_angles = self.rotation_matrix_to_euler(self.cur_R)
             else:
@@ -165,7 +261,7 @@ class DroneVisionTracker:
 
             for pt in good_new:
                 x, y = map(int, pt.ravel())
-                cv2.circle(annotated, (x, y), 3, (0, 255, 0), -1)
+                cv2.circle(annotated, (x, y), 2, (0, 255, 0), -1)
 
             self.prev_pts = good_new.reshape(-1, 1, 2)
         else:
@@ -211,21 +307,20 @@ def main():
         processed_frame, status = tracker.process_frame(frame)
         traj_map = tracker.draw_trajectory_map(width=640, height=480)
 
-        # Display Telemetry Overlay
         color = (0, 255, 0) if "OK" in status else ((255, 255, 0) if "STATIONARY" in status or "LANDING" in status else (0, 0, 255))
-        cv2.putText(processed_frame, f"VO State: {status}", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(processed_frame, f"VO State: {status}", (20, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
         pos_str = f"Pos (X,Y,Z): [{tracker.cur_t[0][0]:.2f}, {tracker.cur_t[1][0]:.2f}, {tracker.cur_t[2][0]:.2f}]"
-        cv2.putText(processed_frame, pos_str, (20, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(processed_frame, pos_str, (20, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
         euler_str = f"Euler [R,P,Y]: [{tracker.euler_angles[0]:.1f}, {tracker.euler_angles[1]:.1f}, {tracker.euler_angles[2]:.1f}] deg"
-        cv2.putText(processed_frame, euler_str, (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        cv2.putText(processed_frame, euler_str, (20, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
 
         dashboard = np.hstack((processed_frame, traj_map))
-        cv2.imshow("UAV Autonomous Vision Engine", dashboard)
+        cv2.imshow("Autonomous UAV Vision & Servoing Engine", dashboard)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
