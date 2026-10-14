@@ -1,7 +1,16 @@
 import cv2
 import numpy as np
 import math
+import time
+import csv
 from ultralytics import YOLO
+
+# Attempt MAVLink import for live drone / SITL simulator integration
+try:
+    from pymavlink import mavutil
+    MAVLINK_AVAILABLE = True
+except ImportError:
+    MAVLINK_AVAILABLE = False
 
 
 class DroneVisionTracker:
@@ -48,11 +57,69 @@ class DroneVisionTracker:
         # 5. Object Detection Model (YOLOv8 Nano)
         self.yolo_model = YOLO("yolov8n.pt")
 
-        # 6. Visual Servoing & Guidance Controller Gains (Proportional Control)
+        # 6. Visual Servoing & Guidance Controller
         self.kp_xy = 0.002
         self.kp_yaw = 0.05
         self.guidance_cmd = {"vx": 0.0, "vy": 0.0, "vz": 0.0, "yaw_rate": 0.0}
         self.flight_mode = "SEARCHING"
+
+        # 7. Flight Telemetry CSV Logger Setup
+        self.log_filename = "flight_telemetry_log.csv"
+        self.log_file = open(self.log_filename, mode='w', newline='')
+        self.csv_writer = csv.writer(self.log_file)
+        self.csv_writer.writerow([
+            "Timestamp", "Pos_X", "Pos_Y", "Pos_Z",
+            "Roll_deg", "Pitch_deg", "Yaw_deg",
+            "Flight_Mode", "Cmd_Vx", "Cmd_Vy", "Cmd_Vz", "Cmd_YawRate"
+        ])
+        self.start_time = time.time()
+
+        # 8. MAVLink Interface Connection Placeholder
+        self.mav_connection = None
+
+    def connect_mavlink(self, connection_string="udp:127.0.0.1:14550"):
+        """Establish MAVLink connection to flight controller or SITL simulator."""
+        if MAVLINK_AVAILABLE:
+            try:
+                self.mav_connection = mavutil.mavlink_connection(connection_string)
+                self.mav_connection.wait_heartbeat(timeout=2)
+                print(f"[MAVLink] Connected successfully to {connection_string}")
+            except Exception as e:
+                print(f"[MAVLink] Connection skipped: {e}")
+        else:
+            print("[MAVLink] pymavlink not installed. Running in standalone mode.")
+
+    def send_mavlink_velocity_command(self):
+        """Send velocity commands (SET_POSITION_TARGET_LOCAL_NED) via MAVLink."""
+        if self.mav_connection is not None:
+            type_mask = 0b0000111111000111  # Use velocity components only
+            self.mav_connection.mav.set_position_target_local_ned_send(
+                0, self.mav_connection.target_system, self.mav_connection.target_component,
+                mavutil.mavlink.MAV_FRAME_BODY_NED,
+                type_mask,
+                0, 0, 0,  # Position X, Y, Z (ignored)
+                self.guidance_cmd["vx"], self.guidance_cmd["vy"], self.guidance_cmd["vz"],  # Velocities m/s
+                0, 0, 0,  # Accelerations (ignored)
+                0, self.guidance_cmd["yaw_rate"]  # Yaw, Yaw rate
+            )
+
+    def log_telemetry(self):
+        """Append current frame telemetry and control state to CSV file."""
+        elapsed_time = round(time.time() - self.start_time, 3)
+        self.csv_writer.writerow([
+            elapsed_time,
+            round(float(self.cur_t[0][0]), 3),
+            round(float(self.cur_t[1][0]), 3),
+            round(float(self.cur_t[2][0]), 3),
+            round(float(self.euler_angles[0]), 2),
+            round(float(self.euler_angles[1]), 2),
+            round(float(self.euler_angles[2]), 2),
+            self.flight_mode,
+            self.guidance_cmd["vx"],
+            self.guidance_cmd["vy"],
+            self.guidance_cmd["vz"],
+            self.guidance_cmd["yaw_rate"]
+        ])
 
     def detect_features_grid(self, gray_frame):
         """Distribute feature points uniformly across grid cells."""
@@ -107,11 +174,9 @@ class DroneVisionTracker:
         h, w = frame_shape[:2]
         center_x, center_y = w // 2, h // 2
 
-        # Errors in image plane
         error_x = target_center[0] - center_x
         error_y = center_y - target_center[1]
 
-        # P-Controller velocity commands
         vx = np.clip(self.kp_xy * error_y, -1.0, 1.0)
         vy = np.clip(self.kp_xy * error_x, -1.0, 1.0)
         yaw_rate = np.clip(self.kp_yaw * (error_x / (w / 2)), -1.0, 1.0)
@@ -163,11 +228,9 @@ class DroneVisionTracker:
         h, w = frame.shape[:2]
         cx, cy = w // 2, h // 2
 
-        # Center Crosshair
         cv2.line(frame, (cx - 20, cy), (cx + 20, cy), (0, 255, 0), 1)
         cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 1)
 
-        # Target Lock Box & Vector Line
         if target_pt is not None:
             tx, ty = target_pt
             cv2.line(frame, (cx, cy), (tx, ty), (0, 255, 255), 2)
@@ -175,7 +238,6 @@ class DroneVisionTracker:
             cv2.putText(frame, "LOCK", (tx + 15, ty + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-        # Guidance Telemetry Overlay
         hud_box_x = 20
         hud_box_y = h - 110
         cv2.rectangle(frame, (hud_box_x, hud_box_y), (hud_box_x + 240, hud_box_y + 90), (0, 0, 0), -1)
@@ -194,13 +256,11 @@ class DroneVisionTracker:
         status_msg = "TRACKING_OK"
         target_center = None
 
-        # 1. AI Target Detection
         targets = self.detect_objects_yolo(annotated)
         if len(targets) > 0:
             target_center = targets[0][1]
             self.flight_mode = f"TRACKING_{targets[0][0].upper()}"
 
-        # 2. Precision Landing Target Detection (Priority Override)
         landing_info = self.detect_landing_target(annotated)
         if landing_info is not None:
             target_center = (landing_info[0], landing_info[1])
@@ -210,17 +270,16 @@ class DroneVisionTracker:
             self.flight_mode = "SEARCHING"
             self.guidance_cmd = {"vx": 0.0, "vy": 0.0, "vz": 0.0, "yaw_rate": 0.0}
 
-        # 3. Compute Control Servoing Commands
         if target_center is not None:
             self.compute_visual_servoing(target_center, frame.shape)
 
-        # 4. Render Tactical HUD
+        self.send_mavlink_velocity_command()
         self.draw_tactical_hud(annotated, target_center)
 
-        # 5. Feature Tracking Pipeline
         if self.prev_frame is None:
             self.prev_frame = gray
             self.prev_pts = self.detect_features_grid(gray)
+            self.log_telemetry()
             return annotated, status_msg
 
         if self.prev_pts is None or len(self.prev_pts) < 40:
@@ -228,6 +287,7 @@ class DroneVisionTracker:
 
         if self.prev_pts is None or len(self.prev_pts) < 8:
             self.prev_frame = gray
+            self.log_telemetry()
             return annotated, "SEARCHING_FEATURES"
 
         p1, st, _ = cv2.calcOpticalFlowPyrLK(self.prev_frame, gray, self.prev_pts, None, **self.lk_params)
@@ -268,7 +328,14 @@ class DroneVisionTracker:
             status_msg = "OUTLIER_REJECTED"
 
         self.prev_frame = gray
+        self.log_telemetry()
         return annotated, status_msg
+
+    def close(self):
+        """Safely close open file handles and connections."""
+        if self.log_file and not self.log_file.closed:
+            self.log_file.close()
+            print(f"[Telemetry] Saved log file successfully to {self.log_filename}")
 
     def draw_trajectory_map(self, width=600, height=600):
         traj_img = np.zeros((height, width, 3), dtype=np.uint8)
@@ -320,12 +387,13 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
 
         dashboard = np.hstack((processed_frame, traj_map))
-        cv2.imshow("Autonomous UAV Vision & Servoing Engine", dashboard)
+        cv2.imshow("Autonomous UAV Vision Suite", dashboard)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
+    tracker.close()
     cv2.destroyAllWindows()
 
 
